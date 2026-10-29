@@ -1,1 +1,786 @@
+name: Build native APK
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write native project files
+        run: |
+          set -e
+          mkdir -p native
+          cd native
+          mkdir -p .
+          cat > settings.gradle.kts <<'ICEMIC_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "IceMic"
+          include(":app")
+          ICEMIC_EOF
+          mkdir -p .
+          cat > build.gradle.kts <<'ICEMIC_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          ICEMIC_EOF
+          mkdir -p .
+          cat > gradle.properties <<'ICEMIC_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.nonTransitiveRClass=true
+          ICEMIC_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'ICEMIC_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.icemic.live"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.icemic.live"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          ICEMIC_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'ICEMIC_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+              <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Ice Mic"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AudioService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          ICEMIC_EOF
+          mkdir -p app/src/main/java/com/icemic/live
+          cat > app/src/main/java/com/icemic/live/Engine.kt <<'ICEMIC_EOF'
+          package com.icemic.live
+
+          import android.content.Context
+          import android.media.AudioAttributes
+          import android.media.AudioDeviceInfo
+          import android.media.AudioFormat
+          import android.media.AudioManager
+          import android.media.AudioRecord
+          import android.media.AudioTrack
+          import android.media.MediaRecorder
+          import android.media.audiofx.AcousticEchoCanceler
+          import android.media.audiofx.NoiseSuppressor
+          import android.os.Process
+          import kotlin.math.PI
+          import kotlin.math.cos
+          import kotlin.math.log10
+          import kotlin.math.max
+          import kotlin.math.pow
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+
+          class Biquad {
+              private var b0 = 1.0
+              private var b1 = 0.0
+              private var b2 = 0.0
+              private var a1 = 0.0
+              private var a2 = 0.0
+              private var z1 = 0.0
+              private var z2 = 0.0
+
+              // type 0 = low shelf, 1 = peaking, 2 = high shelf (RBJ cookbook)
+              fun configure(type: Int, fs: Double, f0: Double, gainDb: Double, q: Double) {
+                  val a = 10.0.pow(gainDb / 40.0)
+                  val w0 = 2.0 * PI * f0 / fs
+                  val cw = cos(w0)
+                  val sw = sin(w0)
+                  val alpha = sw / (2.0 * q)
+                  val sq = 2.0 * sqrt(a) * alpha
+                  var nb0 = 1.0
+                  var nb1 = 0.0
+                  var nb2 = 0.0
+                  var na0 = 1.0
+                  var na1 = 0.0
+                  var na2 = 0.0
+                  when (type) {
+                      0 -> {
+                          nb0 = a * ((a + 1) - (a - 1) * cw + sq)
+                          nb1 = 2 * a * ((a - 1) - (a + 1) * cw)
+                          nb2 = a * ((a + 1) - (a - 1) * cw - sq)
+                          na0 = (a + 1) + (a - 1) * cw + sq
+                          na1 = -2 * ((a - 1) + (a + 1) * cw)
+                          na2 = (a + 1) + (a - 1) * cw - sq
+                      }
+                      1 -> {
+                          nb0 = 1 + alpha * a
+                          nb1 = -2 * cw
+                          nb2 = 1 - alpha * a
+                          na0 = 1 + alpha / a
+                          na1 = -2 * cw
+                          na2 = 1 - alpha / a
+                      }
+                      else -> {
+                          nb0 = a * ((a + 1) + (a - 1) * cw + sq)
+                          nb1 = -2 * a * ((a - 1) + (a + 1) * cw)
+                          nb2 = a * ((a + 1) + (a - 1) * cw - sq)
+                          na0 = (a + 1) - (a - 1) * cw + sq
+                          na1 = 2 * ((a - 1) - (a + 1) * cw)
+                          na2 = (a + 1) - (a - 1) * cw - sq
+                      }
+                  }
+                  b0 = nb0 / na0
+                  b1 = nb1 / na0
+                  b2 = nb2 / na0
+                  a1 = na1 / na0
+                  a2 = na2 / na0
+              }
+
+              fun process(x: Double): Double {
+                  val y = b0 * x + z1
+                  z1 = b1 * x - a1 * y + z2
+                  z2 = b2 * x - a2 * y
+                  return y
+              }
+          }
+
+          object Engine {
+              const val FS = 48000
+              private val FREQS = doubleArrayOf(60.0, 250.0, 1000.0, 4000.0, 12000.0)
+
+              val eqGains = DoubleArray(5)
+              @Volatile var eqDirty = true
+              @Volatile var delayMs = 0
+              @Volatile var volume = 0.8f
+              @Volatile var gateOn = false
+              @Volatile var gateDb = -50
+              @Volatile var aec = true
+              @Volatile var ns = true
+              @Volatile var inputId = -1
+              @Volatile var outputId = -1
+
+              @Volatile var running = false
+              @Volatile var level = 0f
+              @Volatile var status = "Stopped"
+              @Volatile var onStopped: (() -> Unit)? = null
+
+              private var thread: Thread? = null
+              private var aecFx: AcousticEchoCanceler? = null
+              private var nsFx: NoiseSuppressor? = null
+
+              fun label(d: AudioDeviceInfo): String {
+                  val t = when (d.type) {
+                      AudioDeviceInfo.TYPE_BUILTIN_MIC -> "Phone mic"
+                      AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Phone speaker"
+                      AudioDeviceInfo.TYPE_BUILTIN_EARPIECE -> "Phone earpiece"
+                      AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired headset"
+                      AudioDeviceInfo.TYPE_WIRED_HEADPHONES -> "Wired headphones"
+                      AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth"
+                      AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth (call mode)"
+                      AudioDeviceInfo.TYPE_USB_DEVICE -> "USB"
+                      AudioDeviceInfo.TYPE_USB_HEADSET -> "USB headset"
+                      26 -> "Bluetooth LE"
+                      27 -> "Bluetooth LE speaker"
+                      else -> "Other"
+                  }
+                  return t + " - " + d.productName
+              }
+
+              fun setAec(v: Boolean) {
+                  aec = v
+                  try { aecFx?.enabled = v } catch (e: Exception) { }
+              }
+
+              fun setNs(v: Boolean) {
+                  ns = v
+                  try { nsFx?.enabled = v } catch (e: Exception) { }
+              }
+
+              fun start(ctx: Context) {
+                  if (thread != null) return
+                  val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  val inDev = if (inputId >= 0) am.getDevices(AudioManager.GET_DEVICES_INPUTS).firstOrNull { it.id == inputId } else null
+                  val outDev = if (outputId >= 0) am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.id == outputId } else null
+                  running = true
+                  status = "Starting"
+                  val t = Thread { audioLoop(inDev, outDev) }
+                  t.name = "IceMicAudio"
+                  thread = t
+                  t.start()
+              }
+
+              fun stop() {
+                  running = false
+                  val t = thread
+                  if (t != null && t != Thread.currentThread()) {
+                      try { t.join(1500) } catch (e: InterruptedException) { }
+                  }
+              }
+
+              private fun audioLoop(inDev: AudioDeviceInfo?, outDev: AudioDeviceInfo?) {
+                  Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                  var rec: AudioRecord? = null
+                  var trk: AudioTrack? = null
+                  try {
+                      val chunk = 240 // 5 ms at 48 kHz
+                      val inMin = AudioRecord.getMinBufferSize(FS, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_FLOAT)
+                      val r = AudioRecord.Builder()
+                          .setAudioSource(MediaRecorder.AudioSource.MIC)
+                          .setAudioFormat(
+                              AudioFormat.Builder()
+                                  .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                                  .setSampleRate(FS)
+                                  .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                                  .build()
+                          )
+                          .setBufferSizeInBytes(max(inMin, chunk * 4 * 4))
+                          .build()
+                      rec = r
+                      if (r.state != AudioRecord.STATE_INITIALIZED) {
+                          status = "Error: microphone could not start"
+                          return
+                      }
+                      if (inDev != null) r.setPreferredDevice(inDev)
+
+                      val outMin = AudioTrack.getMinBufferSize(FS, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT)
+                      val t = AudioTrack.Builder()
+                          .setAudioAttributes(
+                              AudioAttributes.Builder()
+                                  .setUsage(AudioAttributes.USAGE_MEDIA)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                  .build()
+                          )
+                          .setAudioFormat(
+                              AudioFormat.Builder()
+                                  .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                                  .setSampleRate(FS)
+                                  .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                  .build()
+                          )
+                          .setTransferMode(AudioTrack.MODE_STREAM)
+                          .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                          .setBufferSizeInBytes(max(outMin * 2, chunk * 4 * 4))
+                          .build()
+                      trk = t
+                      if (outDev != null) t.setPreferredDevice(outDev)
+
+                      try {
+                          if (AcousticEchoCanceler.isAvailable()) {
+                              aecFx = AcousticEchoCanceler.create(r.audioSessionId)
+                              aecFx?.enabled = aec
+                          }
+                      } catch (e: Exception) { }
+                      try {
+                          if (NoiseSuppressor.isAvailable()) {
+                              nsFx = NoiseSuppressor.create(r.audioSessionId)
+                              nsFx?.enabled = ns
+                          }
+                      } catch (e: Exception) { }
+
+                      r.startRecording()
+                      t.play()
+
+                      val inb = FloatArray(chunk)
+                      val outb = FloatArray(chunk)
+                      val dl = FloatArray(FS * 2)
+                      var w = 0
+                      val filters = Array(5) { Biquad() }
+                      var gateGain = 1.0f
+                      var count = 0
+                      status = "Live"
+
+                      while (running) {
+                          if (eqDirty) {
+                              eqDirty = false
+                              for (i in 0 until 5) {
+                                  val type = if (i == 0) 0 else if (i == 4) 2 else 1
+                                  val q = if (type == 1) 1.0 else 0.7071
+                                  filters[i].configure(type, FS.toDouble(), FREQS[i], eqGains[i], q)
+                              }
+                          }
+                          val n = r.read(inb, 0, chunk, AudioRecord.READ_BLOCKING)
+                          if (n < 0) {
+                              status = "Error: microphone read failed ($n)"
+                              break
+                          }
+                          var s = 0.0
+                          for (i in 0 until n) s += (inb[i] * inb[i]).toDouble()
+                          val rms = if (n > 0) sqrt(s / n) else 0.0
+                          val db = 20.0 * log10(max(rms, 1e-6))
+                          level = ((db + 70.0) / 70.0).coerceIn(0.0, 1.0).toFloat()
+
+                          val open = !gateOn || db > gateDb
+                          val target = if (open) 1.0f else 0.0f
+                          val d = (delayMs * (FS / 1000)).coerceIn(0, dl.size - 1)
+                          val vol = volume
+
+                          for (i in 0 until n) {
+                              var x = inb[i].toDouble()
+                              for (f in filters) x = f.process(x)
+                              gateGain += (target - gateGain) * 0.002f
+                              dl[w] = (x * gateGain).toFloat()
+                              var ri = w - d
+                              if (ri < 0) ri += dl.size
+                              outb[i] = (dl[ri] * vol).coerceIn(-1.0f, 1.0f)
+                              w++
+                              if (w == dl.size) w = 0
+                          }
+                          t.write(outb, 0, n, AudioTrack.WRITE_BLOCKING)
+
+                          count++
+                          if (count % 200 == 0) {
+                              val ins = r.routedDevice?.let { label(it) } ?: "?"
+                              val outs = t.routedDevice?.let { label(it) } ?: "?"
+                              status = "Live. In: $ins. Out: $outs"
+                          }
+                      }
+                  } catch (e: Exception) {
+                      status = "Error: " + e.message
+                  } finally {
+                      running = false
+                      try { aecFx?.release() } catch (e: Exception) { }
+                      try { nsFx?.release() } catch (e: Exception) { }
+                      aecFx = null
+                      nsFx = null
+                      try { rec?.stop() } catch (e: Exception) { }
+                      try { rec?.release() } catch (e: Exception) { }
+                      try { trk?.stop() } catch (e: Exception) { }
+                      try { trk?.release() } catch (e: Exception) { }
+                      level = 0f
+                      if (!status.startsWith("Error")) status = "Stopped"
+                      thread = null
+                      onStopped?.invoke()
+                  }
+              }
+          }
+          ICEMIC_EOF
+          mkdir -p app/src/main/java/com/icemic/live
+          cat > app/src/main/java/com/icemic/live/AudioService.kt <<'ICEMIC_EOF'
+          package com.icemic.live
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+
+          class AudioService : Service() {
+
+              companion object {
+                  const val ACTION_STOP = "com.icemic.live.STOP"
+                  private const val CHANNEL = "icemic"
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == ACTION_STOP) {
+                      Engine.stop()
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+
+                  val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "Live microphone", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val stopIntent = Intent(this, AudioService::class.java).setAction(ACTION_STOP)
+                  val stopPi = PendingIntent.getService(
+                      this, 1, stopIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val openPi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(this, CHANNEL)
+                      .setContentTitle("Ice Mic is live")
+                      .setContentText("Microphone is being sent to your output")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentIntent(openPi)
+                      .addAction(android.R.drawable.ic_media_pause, "Stop", stopPi)
+                      .setOngoing(true)
+                      .build()
+
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  } else {
+                      startForeground(1, n)
+                  }
+
+                  Engine.onStopped = { stopSelf() }
+                  Engine.start(this)
+                  return START_NOT_STICKY
+              }
+
+              override fun onDestroy() {
+                  Engine.onStopped = null
+                  Engine.stop()
+                  super.onDestroy()
+              }
+          }
+          ICEMIC_EOF
+          mkdir -p app/src/main/java/com/icemic/live
+          cat > app/src/main/java/com/icemic/live/MainActivity.kt <<'ICEMIC_EOF'
+          package com.icemic.live
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.media.AudioDeviceCallback
+          import android.media.AudioDeviceInfo
+          import android.media.AudioManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Spinner
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private val handler = Handler(Looper.getMainLooper())
+              private lateinit var audioManager: AudioManager
+              private lateinit var root: LinearLayout
+              private lateinit var goBtn: Button
+              private lateinit var statusTv: TextView
+              private lateinit var meter: ProgressBar
+              private lateinit var inSpin: Spinner
+              private lateinit var outSpin: Spinner
+              private var inDevs: List<AudioDeviceInfo> = emptyList()
+              private var outDevs: List<AudioDeviceInfo> = emptyList()
+              private val eqBars = ArrayList<SeekBar>()
+
+              private val devCallback = object : AudioDeviceCallback() {
+                  override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+                      refreshDevices()
+                  }
+
+                  override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+                      refreshDevices()
+                  }
+              }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      meter.progress = (Engine.level * 100).toInt()
+                      statusTv.text = Engine.status
+                      goBtn.text = if (Engine.running) "Stop" else "Start"
+                      handler.postDelayed(this, 80)
+                  }
+              }
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun label(s: String, sp: Float = 14f, bold: Boolean = false, color: Int = Color.DKGRAY): TextView {
+                  val t = TextView(this)
+                  t.text = s
+                  t.textSize = sp
+                  t.setTextColor(color)
+                  if (bold) t.setTypeface(t.typeface, Typeface.BOLD)
+                  t.setPadding(0, dp(6), 0, dp(2))
+                  return t
+              }
+
+              private fun section(title: String) {
+                  val t = label(title.uppercase(), 12f, true, Color.GRAY)
+                  t.setPadding(0, dp(18), 0, dp(4))
+                  root.addView(t)
+              }
+
+              private fun slider(
+                  name: String, max: Int, init: Int,
+                  fmt: (Int) -> String, onChange: (Int) -> Unit
+              ): SeekBar {
+                  val row = LinearLayout(this)
+                  row.orientation = LinearLayout.HORIZONTAL
+                  row.gravity = Gravity.CENTER_VERTICAL
+
+                  val nameTv = TextView(this)
+                  nameTv.text = name
+                  nameTv.textSize = 14f
+                  nameTv.layoutParams = LinearLayout.LayoutParams(dp(92), ViewGroup.LayoutParams.WRAP_CONTENT)
+
+                  val valTv = TextView(this)
+                  valTv.text = fmt(init)
+                  valTv.textSize = 13f
+                  valTv.gravity = Gravity.END
+                  valTv.layoutParams = LinearLayout.LayoutParams(dp(70), ViewGroup.LayoutParams.WRAP_CONTENT)
+
+                  val bar = SeekBar(this)
+                  bar.max = max
+                  bar.progress = init
+                  bar.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                  bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                          valTv.text = fmt(progress)
+                          onChange(progress)
+                      }
+
+                      override fun onStartTrackingTouch(seekBar: SeekBar?) { }
+                      override fun onStopTrackingTouch(seekBar: SeekBar?) { }
+                  })
+
+                  row.addView(nameTv)
+                  row.addView(bar)
+                  row.addView(valTv)
+                  root.addView(row)
+                  return bar
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+
+                  val scroll = ScrollView(this)
+                  root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(16), dp(36), dp(16), dp(40))
+                  scroll.addView(root)
+                  setContentView(scroll)
+
+                  root.addView(label("Ice Mic", 26f, true, Color.BLACK))
+                  root.addView(label("Live microphone with equalizer, delay and volume. Use headphones or a Bluetooth speaker.", 13f))
+
+                  goBtn = Button(this)
+                  goBtn.text = "Start"
+                  goBtn.setOnClickListener { onGo() }
+                  root.addView(goBtn)
+
+                  statusTv = label("Stopped", 13f)
+                  root.addView(statusTv)
+
+                  meter = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  meter.max = 100
+                  root.addView(meter)
+                  root.addView(label("Speakers near the mic cause feedback. Start with the volume low.", 12f, false, Color.GRAY))
+
+                  section("Devices")
+                  root.addView(label("Input", 13f))
+                  inSpin = Spinner(this)
+                  root.addView(inSpin)
+                  root.addView(label("Output", 13f))
+                  outSpin = Spinner(this)
+                  root.addView(outSpin)
+                  val refresh = Button(this)
+                  refresh.text = "Refresh devices"
+                  refresh.setOnClickListener { refreshDevices() }
+                  root.addView(refresh)
+                  root.addView(label("Pair your Bluetooth speaker in Android settings first. It appears in the Output list when connected. Leave Output on Automatic to follow the system choice.", 12f, false, Color.GRAY))
+
+                  section("Equalizer")
+                  val names = listOf("60 Hz", "250 Hz", "1 kHz", "4 kHz", "12 kHz")
+                  for (i in 0 until 5) {
+                      val bar = slider(names[i], 48, 24,
+                          { p -> String.format("%+.1f dB", (p - 24) / 2.0) },
+                          { p ->
+                              Engine.eqGains[i] = (p - 24) / 2.0
+                              Engine.eqDirty = true
+                          })
+                      eqBars.add(bar)
+                  }
+                  val presets = LinearLayout(this)
+                  presets.orientation = LinearLayout.HORIZONTAL
+                  presets.addView(presetButton("Flat", doubleArrayOf(0.0, 0.0, 0.0, 0.0, 0.0)))
+                  presets.addView(presetButton("Voice", doubleArrayOf(-6.0, -2.0, 2.0, 4.0, 1.0)))
+                  presets.addView(presetButton("Bass boost", doubleArrayOf(7.0, 3.0, 0.0, -1.0, -2.0)))
+                  root.addView(presets)
+
+                  section("Delay and volume")
+                  slider("Delay", 200, 0, { p -> "${p * 5} ms" }, { p -> Engine.delayMs = p * 5 })
+                  slider("Volume", 200, 80, { p -> "$p%" }, { p -> Engine.volume = p / 100f })
+
+                  section("Echo reduction")
+                  val aecBox = CheckBox(this)
+                  aecBox.text = "Echo cancellation (if the phone supports it)"
+                  aecBox.isChecked = true
+                  aecBox.setOnCheckedChangeListener { _, c -> Engine.setAec(c) }
+                  root.addView(aecBox)
+                  val nsBox = CheckBox(this)
+                  nsBox.text = "Noise suppression (if the phone supports it)"
+                  nsBox.isChecked = true
+                  nsBox.setOnCheckedChangeListener { _, c -> Engine.setNs(c) }
+                  root.addView(nsBox)
+                  val gateBox = CheckBox(this)
+                  gateBox.text = "Noise gate (mutes quiet room sound)"
+                  gateBox.setOnCheckedChangeListener { _, c -> Engine.gateOn = c }
+                  root.addView(gateBox)
+                  slider("Gate level", 50, 20, { p -> "${p - 70} dB" }, { p -> Engine.gateDb = p - 70 })
+
+                  refreshDevices()
+                  audioManager.registerAudioDeviceCallback(devCallback, handler)
+              }
+
+              private fun presetButton(name: String, gains: DoubleArray): Button {
+                  val b = Button(this)
+                  b.text = name
+                  b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                  b.setOnClickListener {
+                      for (i in 0 until 5) eqBars[i].progress = (gains[i] * 2).toInt() + 24
+                  }
+                  return b
+              }
+
+              private fun idAt(spin: Spinner, devs: List<AudioDeviceInfo>): Int {
+                  val p = spin.selectedItemPosition
+                  return if (p <= 0 || p > devs.size) -1 else devs[p - 1].id
+              }
+
+              private fun fill(spin: Spinner, first: String, devs: List<AudioDeviceInfo>, keep: Int) {
+                  val items = ArrayList<String>()
+                  items.add(first)
+                  for (d in devs) items.add(Engine.label(d))
+                  val ad = ArrayAdapter(this, android.R.layout.simple_spinner_item, items)
+                  ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+                  spin.adapter = ad
+                  val idx = devs.indexOfFirst { it.id == keep }
+                  spin.setSelection(if (idx >= 0) idx + 1 else 0)
+              }
+
+              private fun refreshDevices() {
+                  val curIn = idAt(inSpin, inDevs)
+                  val curOut = idAt(outSpin, outDevs)
+                  inDevs = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+                      .filter { it.type != 7 && it.type != 26 }
+                  outDevs = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+                  fill(inSpin, "Automatic", inDevs, curIn)
+                  fill(outSpin, "Automatic (system choice)", outDevs, curOut)
+              }
+
+              private fun onGo() {
+                  if (Engine.running) {
+                      startService(Intent(this, AudioService::class.java).setAction(AudioService.ACTION_STOP))
+                      return
+                  }
+                  val need = ArrayList<String>()
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      need.add(Manifest.permission.RECORD_AUDIO)
+                  }
+                  if (Build.VERSION.SDK_INT >= 31 &&
+                      checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      need.add(Manifest.permission.BLUETOOTH_CONNECT)
+                  }
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  if (need.isNotEmpty()) {
+                      requestPermissions(need.toTypedArray(), 1)
+                  } else {
+                      begin()
+                  }
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                      begin()
+                  } else {
+                      statusTv.text = "Microphone permission is needed. Allow it and press Start again."
+                  }
+              }
+
+              private fun begin() {
+                  Engine.inputId = idAt(inSpin, inDevs)
+                  Engine.outputId = idAt(outSpin, outDevs)
+                  startForegroundService(Intent(this, AudioService::class.java))
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  handler.post(tick)
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  handler.removeCallbacks(tick)
+              }
+
+              override fun onDestroy() {
+                  audioManager.unregisterAudioDeviceCallback(devCallback)
+                  super.onDestroy()
+              }
+          }
+          ICEMIC_EOF
+      - name: Build debug APK
+        working-directory: native
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IceMic-native-apk
+          path: native/app/build/outputs/apk/debug/app-debug.apk
 
