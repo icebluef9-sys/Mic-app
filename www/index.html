@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Live Mic Equalizer</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--tx:#1b1f24;--mute:#667085;--ac:#2563eb;--bd:#dde1e7;--ok:#16a34a;--bad:#dc2626;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#12151a;--card:#1b2028;--tx:#e8ebf0;--mute:#98a2b3;--ac:#60a5fa;--bd:#2c333d}}
+:root[data-theme="dark"]{--bg:#12151a;--card:#1b2028;--tx:#e8ebf0;--mute:#98a2b3;--ac:#60a5fa;--bd:#2c333d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:720px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:22px;margin:0 0 4px}
+p.sub{color:var(--mute);margin:0 0 16px;font-size:14px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:14px}
+h2{font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:var(--mute);margin:0 0 12px}
+button{font:inherit;border:0;border-radius:8px;padding:10px 18px;background:var(--ac);color:#fff;cursor:pointer;font-weight:600}
+button.stop{background:var(--bad)}
+select{font:inherit;width:100%;padding:8px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--tx)}
+.row{display:flex;align-items:center;gap:12px;margin:10px 0}
+.row label{flex:0 0 110px;font-size:14px}
+.row input[type=range]{flex:1;accent-color:var(--ac)}
+.row output{flex:0 0 64px;text-align:right;font-variant-numeric:tabular-nums;color:var(--mute);font-size:14px}
+.eq{display:flex;justify-content:space-between;gap:6px;align-items:flex-end}
+.band{display:flex;flex-direction:column;align-items:center;flex:1;gap:6px;font-size:12px;color:var(--mute)}
+.band input{writing-mode:vertical-lr;direction:rtl;height:150px;accent-color:var(--ac)}
+.band output{color:var(--tx);font-variant-numeric:tabular-nums}
+.meter{height:10px;background:var(--bd);border-radius:5px;overflow:hidden}
+.meter div{height:100%;width:0;background:var(--ok);transition:width .05s}
+.tog{display:flex;gap:8px;align-items:center;margin:8px 0;font-size:14px}
+.warn{font-size:13px;color:var(--mute);margin-top:10px}
+#status{font-size:14px;margin-left:10px;color:var(--mute)}
+input[type=text]{flex:1;min-width:0;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--bd);background:var(--card);color:var(--tx)}
+</style>
+</head>
+<body>
+<main>
+<h1>Live Mic Equalizer</h1>
+<p class="sub">Mic in, equalizer, delay, volume, out. Use headphones or a Bluetooth speaker.</p>
+
+<div class="card">
+  <button id="go">Start</button><span id="status">Stopped</span>
+  <div class="meter" style="margin-top:14px"><div id="lvl"></div></div>
+  <p class="warn">Speakers near the mic cause feedback. Start with the volume low.</p>
+</div>
+
+<div class="card">
+  <h2>Devices</h2>
+  <div class="row"><label for="inSel">Input</label><select id="inSel"><option value="">Default microphone</option></select></div>
+  <div class="row"><label for="outSel">Output</label><select id="outSel"><option value="">Default output</option></select></div>
+  <div class="row"><button id="rf">Refresh devices</button><button id="pk" style="background:var(--mute)">Pick output device</button></div>
+  <p class="warn">Web pages cannot scan for or pair Bluetooth audio devices. Pair the speaker or headset in your phone or computer Bluetooth settings first, then press Refresh devices.</p>
+  <p class="warn" id="sinkNote"></p>
+</div>
+
+<div class="card">
+  <h2>Equalizer and presets</h2>
+  <div class="eq" id="eq"></div>
+  <div class="row"><button id="flat" style="background:var(--mute)">Reset EQ</button></div>
+  <div class="row"><select id="pre" aria-label="Preset"></select><button id="load">Load</button><button id="delp" style="background:var(--mute)">Delete</button></div>
+  <div class="row"><input type="text" id="pname" placeholder="Preset name" maxlength="30"><button id="save">Save</button></div>
+</div>
+
+<div class="card">
+  <h2>Delay and volume</h2>
+  <div class="row"><label for="del">Delay / sync</label><input id="del" type="range" min="-500" max="1000" step="5" value="0"><output id="delO">0 ms</output></div>
+  <div class="row"><label for="vol">Volume</label><input id="vol" type="range" min="0" max="200" step="1" value="80"><output id="volO">80%</output></div>
+  <p class="warn">Positive values delay the mic. Negative values delay the backing track instead, so you can line it up with the mic path.</p>
+  <div class="row"><label for="trk">Backing track</label><input id="trk" type="file" accept="audio/*" style="flex:1;min-width:0"><button id="tp">Play</button></div>
+</div>
+
+<div class="card">
+  <h2>Echo reduction</h2>
+  <label class="tog"><input type="checkbox" id="aec" checked> Echo cancellation</label>
+  <label class="tog"><input type="checkbox" id="ns" checked> Noise suppression</label>
+  <label class="tog"><input type="checkbox" id="gate"> Noise gate (mutes quiet room sound)</label>
+  <div class="row"><label for="thr">Gate level</label><input id="thr" type="range" min="-70" max="-20" value="-50"><output id="thrO">-50 dB</output></div>
+  <label class="tog"><input type="checkbox" id="fb"> Feedback suppressor (auto notch filters)</label>
+  <div class="row"><button id="fbc" style="background:var(--mute)">Clear notches</button><span id="fbO" class="warn" style="margin:0">No feedback detected</span></div>
+  <p class="warn">Echo cancellation and noise suppression are browser features. A change applies at once while running. The suppressor finds a steady howl and cuts that frequency, up to 4 notches.</p>
+</div>
+</main>
+
+<script>
+const FREQS=[60,250,1000,4000,12000];
+const $=id=>document.getElementById(id);
+let ctx,stream,src,filters=[],delay,gain,gateGain,analyser,raf,running=false,notches=[],spec,sbuf,fbList=[],hold=0,lastBin=-1,nIdx=0,tDelay,bt,trackURL;
+
+// Build EQ sliders
+FREQS.forEach((f,i)=>{
+  const d=document.createElement('div');d.className='band';
+  const label=f>=1000?(f/1000)+'k':f;
+  d.innerHTML=`<output id="eo${i}">0 dB</output><input type="range" id="eb${i}" min="-12" max="12" step="0.5" value="0" aria-label="${label} Hz"><span>${label}</span>`;
+  $('eq').appendChild(d);
+  d.querySelector('input').addEventListener('input',e=>{
+    $('eo'+i).textContent=e.target.value+' dB';
+    if(filters[i])filters[i].gain.value=+e.target.value;
+  });
+});
+$('flat').onclick=()=>FREQS.forEach((_,i)=>{const s=$('eb'+i);s.value=0;s.dispatchEvent(new Event('input'))});
+
+function applyDelay(){
+  const v=+$('del').value;
+  $('delO').textContent=v+' ms';
+  if(delay)delay.delayTime.value=Math.max(0,v)/1000;
+  if(tDelay)tDelay.delayTime.value=Math.max(0,-v)/1000;
+}
+$('del').oninput=applyDelay;
+$('vol').oninput=e=>{$('volO').textContent=e.target.value+'%';if(gain)gain.gain.value=e.target.value/100};
+$('thr').oninput=e=>{$('thrO').textContent=e.target.value+' dB'};
+
+async function listDevices(){
+  try{
+    const ds=await navigator.mediaDevices.enumerateDevices();
+    const fill=(sel,kind)=>{
+      const cur=sel.value;sel.length=1;
+      ds.filter(d=>d.kind===kind).forEach(d=>{
+        const o=document.createElement('option');o.value=d.deviceId;o.textContent=d.label||kind;sel.appendChild(o);
+      });
+      sel.value=cur;
+    };
+    fill($('inSel'),'audioinput');fill($('outSel'),'audiooutput');
+  }catch(e){}
+}
+
+async function getStream(){
+  return navigator.mediaDevices.getUserMedia({audio:{
+    deviceId:$('inSel').value?{exact:$('inSel').value}:undefined,
+    echoCancellation:$('aec').checked,
+    noiseSuppression:$('ns').checked,
+    autoGainControl:false,
+    latency:0
+  }});
+}
+
+async function start(){
+  try{
+    stream=await getStream();
+  }catch(e){
+    $('status').textContent='Mic access denied or unavailable';return;
+  }
+  ctx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
+  src=ctx.createMediaStreamSource(stream);
+  filters=FREQS.map((f,i)=>{
+    const b=ctx.createBiquadFilter();
+    b.type=i===0?'lowshelf':i===FREQS.length-1?'highshelf':'peaking';
+    b.frequency.value=f;b.Q.value=1;b.gain.value=+$('eb'+i).value;return b;
+  });
+  delay=ctx.createDelay(2);tDelay=ctx.createDelay(2);applyDelay();
+  gateGain=ctx.createGain();
+  gain=ctx.createGain();gain.gain.value=$('vol').value/100;
+  analyser=ctx.createAnalyser();analyser.fftSize=1024;
+  spec=ctx.createAnalyser();spec.fftSize=4096;spec.smoothingTimeConstant=0.4;sbuf=new Float32Array(spec.frequencyBinCount);
+  let node=src;
+  filters.forEach(f=>{node.connect(f);node=f});
+  notches=[0,1,2,3].map(()=>{const n=ctx.createBiquadFilter();n.type='peaking';n.gain.value=0;n.frequency.value=1000;return n});
+  notches.forEach(n=>{node.connect(n);node=n});
+  fbList=[];nIdx=0;showFb();
+  node.connect(spec);
+  node.connect(gateGain);gateGain.connect(delay);delay.connect(gain);gain.connect(ctx.destination);
+  src.connect(analyser);
+  await applySink();
+  await listDevices();
+  setupTrack();running=true;$('go').textContent='Stop';$('go').className='stop';$('status').textContent='Live';
+  loop();
+}
+
+function stop(){
+  running=false;cancelAnimationFrame(raf);if(bt){bt.pause();bt=null}
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  if(ctx)ctx.close();
+  $('go').textContent='Start';$('go').className='';$('status').textContent='Stopped';$('lvl').style.width='0';
+}
+
+function showFb(){$('fbO').textContent=fbList.length?'Notches: '+fbList.map(f=>Math.round(f)+' Hz').join(', '):'No feedback detected'}
+function addNotch(hz){
+  if(fbList.some(f=>Math.abs(f-hz)/hz<0.05))return;
+  const n=notches[nIdx%notches.length];
+  n.type='notch';n.frequency.value=hz;n.Q.value=30;
+  fbList[nIdx%notches.length]=hz;nIdx++;showFb();
+}
+function detectFeedback(){
+  spec.getFloatFrequencyData(sbuf);
+  let pk=-200,pi=0;
+  for(let i=4;i<sbuf.length;i++){if(sbuf[i]>pk){pk=sbuf[i];pi=i}}
+  const hz=pi*ctx.sampleRate/spec.fftSize;
+  let sum=0,c=0;
+  for(let i=Math.max(0,pi-20);i<Math.min(sbuf.length,pi+20);i++){if(Math.abs(i-pi)>2){sum+=sbuf[i];c++}}
+  const prom=pk-sum/c;
+  if(pk>-35&&prom>20&&hz>150){
+    if(Math.abs(pi-lastBin)<=1)hold++;else{hold=1;lastBin=pi}
+    if(hold>=12){addNotch(hz);hold=0}
+  }else hold=0;
+}
+const buf=new Float32Array(1024);
+function loop(){
+  if(!running)return;
+  analyser.getFloatTimeDomainData(buf);
+  let s=0;for(let i=0;i<buf.length;i++)s+=buf[i]*buf[i];
+  const db=20*Math.log10(Math.sqrt(s/buf.length)||1e-6);
+  $('lvl').style.width=Math.max(0,Math.min(100,(db+70)/70*100))+'%';
+  if($('fb').checked)detectFeedback();
+  const open=!$('gate').checked||db>+$('thr').value;
+  gateGain.gain.setTargetAtTime(open?1:0,ctx.currentTime,0.03);
+  raf=requestAnimationFrame(loop);
+}
+
+async function applySink(){
+  const note=$('sinkNote');
+  if(!ctx)return;
+  if(typeof ctx.setSinkId!=='function'){
+    note.textContent='Choosing an output is not supported in this browser. Set the Bluetooth speaker as the system output instead.';return;
+  }
+  try{await ctx.setSinkId($('outSel').value||'');note.textContent='';}
+  catch(e){note.textContent='Could not switch output. Set the Bluetooth speaker as the system output instead.'}
+}
+
+async function restartStream(){
+  if(!running)return;
+  stream.getTracks().forEach(t=>t.stop());
+  try{
+    stream=await getStream();
+    src.disconnect();
+    src=ctx.createMediaStreamSource(stream);
+    src.connect(filters[0]);src.connect(analyser);
+  }catch(e){$('status').textContent='Mic error'}
+}
+
+$('fbc').onclick=()=>{notches.forEach(n=>{n.type='peaking';n.gain.value=0});fbList=[];nIdx=0;showFb()};
+
+const BUILT={'Flat':{eq:[0,0,0,0,0],d:0,v:80},'Voice':{eq:[-6,-2,2,4,1],d:0,v:80},'Bass boost':{eq:[7,3,0,-1,-2],d:0,v:80}};
+let user={};
+try{user=JSON.parse(localStorage.getItem('micEqPresets')||'{}')}catch(e){user={}}
+function persist(){try{localStorage.setItem('micEqPresets',JSON.stringify(user))}catch(e){}}
+function refreshPresets(){const s=$('pre');s.innerHTML='';Object.keys({...BUILT,...user}).forEach(n=>{const o=document.createElement('option');o.textContent=n;s.appendChild(o)})}
+function setVal(id,v){const e=$(id);e.value=v;e.dispatchEvent(new Event('input'))}
+$('load').onclick=()=>{const p=({...BUILT,...user})[$('pre').value];if(!p)return;p.eq.forEach((v,i)=>setVal('eb'+i,v));setVal('del',p.d);setVal('vol',p.v)};
+$('save').onclick=()=>{const n=$('pname').value.trim();if(!n)return;user[n]={eq:FREQS.map((_,i)=>+$('eb'+i).value),d:+$('del').value,v:+$('vol').value};persist();refreshPresets();$('pre').value=n;$('pname').value=''};
+$('delp').onclick=()=>{const n=$('pre').value;if(user[n]){delete user[n];persist();refreshPresets()}};
+refreshPresets();
+
+$('rf').onclick=async()=>{
+  try{const t=await getStream();t.getTracks().forEach(x=>x.stop())}catch(e){$('sinkNote').textContent='Allow microphone access to see device names.'}
+  await listDevices();
+};
+$('pk').onclick=async()=>{
+  if(!navigator.mediaDevices.selectAudioOutput){$('sinkNote').textContent='This browser has no output picker. Use the Output list or set the speaker in system settings.';return}
+  try{
+    const d=await navigator.mediaDevices.selectAudioOutput();
+    await listDevices();
+    if(![...$('outSel').options].some(o=>o.value===d.deviceId)){const o=document.createElement('option');o.value=d.deviceId;o.textContent=d.label||'Selected output';$('outSel').appendChild(o)}
+    $('outSel').value=d.deviceId;await applySink();
+  }catch(e){}
+};
+function setupTrack(){
+  if(!ctx||!trackURL)return;
+  if(bt)bt.pause();
+  bt=new Audio(trackURL);bt.loop=true;
+  const tn=ctx.createMediaElementSource(bt);
+  tn.connect(tDelay);tDelay.connect(gain);
+  bt.onplay=()=>{$('tp').textContent='Pause'};bt.onpause=()=>{$('tp').textContent='Play'};
+}
+$('trk').onchange=e=>{const f=e.target.files[0];if(!f)return;if(trackURL)URL.revokeObjectURL(trackURL);trackURL=URL.createObjectURL(f);setupTrack()};
+$('tp').onclick=()=>{if(!bt)return;bt.paused?bt.play():bt.pause()};
+$('go').onclick=()=>running?stop():start();
+['aec','ns','inSel'].forEach(id=>$(id).addEventListener('change',restartStream));
+$('outSel').addEventListener('change',applySink);
+if(navigator.mediaDevices)navigator.mediaDevices.addEventListener?.('devicechange',listDevices);
+</script>
+</body>
+</html>
