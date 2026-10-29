@@ -15,8 +15,22 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Use preinstalled Android SDK and accept licenses
+        run: |
+          set -e
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          # Find whichever sdkmanager actually exists on this runner
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "No sdkmanager found under $SDK/cmdline-tools" >&2
+            find "$SDK" -name sdkmanager 2>/dev/null >&2
+            exit 1
+          fi
+          echo "Using $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          # Gradle's Android plugin will auto-download platform-34 and build-tools as needed.
 
       - name: Write native project files
         run: |
@@ -785,6 +799,10 @@ jobs:
               }
           }
           ICEMIC_EOF
+
+      - name: Point project at the SDK
+        working-directory: native
+        run: echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
       - name: Generate Gradle wrapper
         working-directory: native
