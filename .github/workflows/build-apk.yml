@@ -9,19 +9,21 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.7
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Write native project files
         run: |
           set -e
           mkdir -p native
           cd native
-          mkdir -p .
+
           cat > settings.gradle.kts <<'ICEMIC_EOF'
           pluginManagement {
               repositories {
@@ -39,18 +41,20 @@ jobs:
           rootProject.name = "IceMic"
           include(":app")
           ICEMIC_EOF
-          mkdir -p .
+
           cat > build.gradle.kts <<'ICEMIC_EOF'
           plugins {
               id("com.android.application") version "8.5.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
           ICEMIC_EOF
-          mkdir -p .
+
           cat > gradle.properties <<'ICEMIC_EOF'
           org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
           android.nonTransitiveRClass=true
           ICEMIC_EOF
+
           mkdir -p app
           cat > app/build.gradle.kts <<'ICEMIC_EOF'
           plugins {
@@ -79,6 +83,7 @@ jobs:
               }
           }
           ICEMIC_EOF
+
           mkdir -p app/src/main
           cat > app/src/main/AndroidManifest.xml <<'ICEMIC_EOF'
           <?xml version="1.0" encoding="utf-8"?>
@@ -115,6 +120,7 @@ jobs:
               </application>
           </manifest>
           ICEMIC_EOF
+
           mkdir -p app/src/main/java/com/icemic/live
           cat > app/src/main/java/com/icemic/live/Engine.kt <<'ICEMIC_EOF'
           package com.icemic.live
@@ -222,7 +228,7 @@ jobs:
               @Volatile var status = "Stopped"
               @Volatile var onStopped: (() -> Unit)? = null
 
-              private var thread: Thread? = null
+              @Volatile private var thread: Thread? = null
               private var aecFx: AcousticEchoCanceler? = null
               private var nsFx: NoiseSuppressor? = null
 
@@ -254,6 +260,7 @@ jobs:
                   try { nsFx?.enabled = v } catch (e: Exception) { }
               }
 
+              @Synchronized
               fun start(ctx: Context) {
                   if (thread != null) return
                   val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -412,6 +419,7 @@ jobs:
               }
           }
           ICEMIC_EOF
+
           mkdir -p app/src/main/java/com/icemic/live
           cat > app/src/main/java/com/icemic/live/AudioService.kt <<'ICEMIC_EOF'
           package com.icemic.live
@@ -480,6 +488,7 @@ jobs:
               }
           }
           ICEMIC_EOF
+
           mkdir -p app/src/main/java/com/icemic/live
           cat > app/src/main/java/com/icemic/live/MainActivity.kt <<'ICEMIC_EOF'
           package com.icemic.live
@@ -776,11 +785,16 @@ jobs:
               }
           }
           ICEMIC_EOF
+
+      - name: Generate Gradle wrapper
+        working-directory: native
+        run: gradle wrapper --gradle-version 8.7 --no-daemon
+
       - name: Build debug APK
         working-directory: native
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
       - uses: actions/upload-artifact@v4
         with:
           name: IceMic-native-apk
           path: native/app/build/outputs/apk/debug/app-debug.apk
-
